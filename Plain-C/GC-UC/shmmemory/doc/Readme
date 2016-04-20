@@ -1,0 +1,102 @@
+简述：
+	在应用过程中出现了一种消费者生产者问题场景，其特点是只有一个进程会频
+繁写入共享数据区，但可能有多个进程频繁读取该共享内存。同时期望有数据更新就立
+即可以写入共享数据区，而读取进程可以接受一定比例的数据请求失败,但要可以判断
+读取的数据是否有效。所以考虑使用无锁机制。
+	比较了以下的锁机制。在单个CPU核心的情况下，其中有些机制的实现可能是简
+单的，甚至有些锁机制都可以通过禁用中断和进程切换来简单的替代，但是当前的程
+序处于应用层所以做这样的假设是不合理的。
+	seqlock 顺序锁,选择这种机制。
+	RCU
+		这种机制非常理想，但是需要动态分配和释放内存支持，而且旧数据
+		存储区在所有读进程结束后才释放，也就是说要支持数量未定的数据
+		区。比较难实现。
+	kfifo
+		fifo机制无法适应多个进程获取同一份数据和尽量保持数据最新的场
+		景。
+
+shm+seqlock的实现：
+	注意：
+		shm+seqlock只是实现了安全读写，对数据内容的判断需要其它的逻辑
+		来完成，这里并不包含。例如有些数据读取一次以后需要标记为不存在
+		在当前的实现就是不支持的，也是无法在当前层实现的，这会破坏无锁
+		处理逻辑。
+	原理：
+		seqlock用于能够区分读与写的场合，并且是读操作很多、写操作很少，
+		写操作的优先权大于读操作。seqlock的实现思路是，用一个递增的整
+		型数表示sequence。写操作进入临界区时，sequence++；退出临界区
+		时，sequence再++。写操作还需要获得一个锁（比如mutex），这个锁
+		仅用于写写互斥，以保证同一时间最多只有一个正在进行的写操作。当
+		sequence为奇数时，表示有写操作正在进行，这时读操作要进入临界区
+		需要等待，直到sequence变为偶数。读操作进入临界区时，需要记录下
+		当前sequence的值，等它退出临界区的时候用记录的sequence与当前
+		sequence做比较，不相等则表示在读操作进入临界区期间发生了写操作，
+		这时候读操作读到的东西是无效的，需要返回重试
+	结构体：
+		将构体shmlock嵌入到共享内存中
+		struct shmlock{
+			atomic_t sequence;
+		#ifdef SHMLOCK_USE_SPINLOCK
+			pthread_spinlock_t writelock;		
+		#endif
+			int statue;
+		};
+
+		struct shmt{
+			void *shm;//指向共享内存在当前进程映射的内存
+			int shmid;//共享内存的id
+			int size;//需要分配的大小，不包含struct shmlock
+		};
+	函数：
+		/*
+		**brief 创建共享内存,并且映射到当前进程
+		**param1 filepath 一个文件路径名，ftok使用
+		**param2 magickey 一个键值，ftok使用
+		**param3 sizeofshm 需要分配的共享内存大小（字节）,不包含struct shmlock结构
+		**param4 shmo 保存了共享内存信息的结构
+		**param5 shmflg 如果是首次创建共享内存使用IPC_CREATE,由于共享内存在所有映射它的
+		**	 进程退出后才会被释放，所以是否使用IPC_EXCL需要依据具体情况。
+		**	 如果是创建共享内存的进程，需要IPC_CREATE
+		**	 只是想获取一个由其它进程创建的共享内存不应使用IPC_CREATE
+		**	 详细见ipc/util.c中函数ipcget_public
+		*/
+		int ShmCreat(char *filepath,int magickey,int sizeofshm,struct shmt *shmo,int shmflg)
+
+		/*
+		**brief 解除映射到当前进程的共享内存
+		**param1 保存了共享内存信息的结构
+		*/
+		int ShmUnmap(struct shmt *shmo);
+		
+		/*
+		**brief 解除映射、删除共享内存
+		**param1 保存了共享内存信息的结构
+		**/
+		int ShmDestroy(struct shmt *shmo);
+		/*
+		**brief 从共享内存读取数据
+		**param1 保存了共享内存信息的结构
+		**param2 指向存储返回数据的空间
+		**/
+		int ShmRead(struct shmt *shmo,void *data);
+		/*
+		**brief 从共享内存读取数据
+		**param1 保存了共享内存信息的结构
+		**param2 指向存储待写入数据的空间
+		**/
+		int ShmWrite(struct shmt *shmo,void *data);
+		/*使用自旋锁的版本*/
+		int ShmSpinWrite(struct shmt *shmo,void *data);
+
+
+NOTICE!!!
+	在调用ShmCreat时要注意,如果当前进程创建了该共享内存,之后该进程放弃
+了该共享内存,之后想再次创建同ID共享内存时应十分小心判断是否要初始化该共享
+内存中的spin_lock.
+
+#Changes 2016.03.21
+#int ShmCreat(char *filepath,int magickey,int sizeofshm,struct shmt *shmo,int shmflg,int flg)
+#添加了shmflg参数，用于适应只希望获取共享内存而不想创建的情况,上一版本使用IPC_CREATE作为默认。
+#添加了flg参数，用于控制是否初始化spinlock,使用宏SHMLOCK_USE_SPINLOCK表示使用spinlock
+#添加了int ShmSpinWrite(struct shmt *shmo,void *data),用于支持spinlock
+#由于该程序被设计为一个库，无法通过宏定义控制支持使用和不使用spinlock两中情#况同时存在，所以进行了以上修改。
